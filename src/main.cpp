@@ -1,72 +1,59 @@
 #include "backends/sfml_renderer.hpp"
 #include "core/styles.hpp"
-#include "core/types.hpp"
 #include "geom/path.hpp"
 #include "gfx/frame.hpp"
-#include "turtle/turtle.hpp"
 #include <SFML/Graphics.hpp>
-#include <algorithm>
 #include <cmath>
-#include <functional>
 #include <optional>
 #include <vector>
 
-// -------- helpers maths --------
-static mu::Vec2f rotDeg(const mu::Vec2f& v, float deg) {
-    return mu::rotate(v, deg);
-}
-
-// Equilatéral CCW centré en c
-static std::vector<mu::Vec2f> makeEquilateral(mu::Vec2f c, float R) {
-    std::vector<mu::Vec2f> t(3);
-    t[0] = { c.x + R * std::cos(mu::deg2rad(-90.f)), c.y + R * std::sin(mu::deg2rad(-90.f)) };
-    t[1] = { c.x + R * std::cos(mu::deg2rad(30.f)), c.y + R * std::sin(mu::deg2rad(30.f)) };
-    t[2] = { c.x + R * std::cos(mu::deg2rad(150.f)), c.y + R * std::sin(mu::deg2rad(150.f)) };
-    return t;  // CCW
-}
-
-// Subdivision Koch pour un polygone fermé CCW (bump vers l'extérieur)
-static std::vector<mu::Vec2f> kochSubdivide(const std::vector<mu::Vec2f>& in) {
-    std::vector<mu::Vec2f> out;
-    out.reserve(in.size() * 4);
-    const size_t N = in.size();
-    for (size_t i = 0; i < N; ++i) {
-        mu::Vec2f A = in[i];
-        mu::Vec2f B = in[(i + 1) % N];
-        mu::Vec2f AB = B - A;                   // utilise l’opérateur membre existant
-        mu::Vec2f p1 = A + (AB / 3.f);          // idem pour / et +
-        mu::Vec2f p2 = A + (AB * (2.f / 3.f));  // idem pour *
-        mu::Vec2f p3 = p1 + rotDeg(p2 - p1, -60.f);
-        out.push_back(A);
-        out.push_back(p1);
-        out.push_back(p3);
-        out.push_back(p2);
-    }
-    return out;
-}
-
-static std::vector<mu::Vec2f> makeKochSnowflake(mu::Vec2f center, float radius, int iterations) {
-    iterations = std::clamp(iterations, 0, 8);
-    auto poly = makeEquilateral(center, radius);
-    for (int i = 0; i < iterations; ++i)
-        poly = kochSubdivide(poly);
-    return poly;
-}
-
-static mu::Mat3f composeTRS(mu::Vec2f t, float rotDeg, mu::Vec2f s) {
+static mu::Mat3f composeTRS(mu::Vec2f t, f32 rotDeg, mu::Vec2f s) {
     return mu::Mat3f::translation(t.x, t.y) * mu::Mat3f::rotation(rotDeg) *
            mu::Mat3f::scale(s.x, s.y);
 }
+static inline f32 clampf(f32 v, f32 a, f32 b) {
+    return (v < a) ? a : (v > b) ? b : v;
+}
 
-// ---------------- main ----------------
-int main() {
+static geom::Path makeRegularPolygon(i32 sides) {
+    geom::Path P;
+    P.closed = true;
+    const f32 twoPi = 2.f * mu::PI;
+    for (i32 i = 0; i < sides; ++i) {
+        f32 a = twoPi * (f32)i / (f32)sides;
+        P.add({ std::cos(a), std::sin(a) });
+    }
+    return P;
+}
+
+i32 main() {
+    // ===========
+    // TWEAKABLES
+    // ===========
+    const i32 POLY_SIDES = 4;
+    const i32 INSTANCES = 5000;
+    const f32 BASE_SCALE_PX = 320.f;
+    const f32 SCALE_RATIO = 0.950f;
+    const f32 ROT_STEP_DEG = 6.0f;
+    const f32 GLOBAL_ROT_SPEED = 12.f;
+    const f32 STROKE_PX = 1.0f;
+    const f32 ARC_TOLERANCE_PX = 0.6f;
+    const bool USE_GRADIENT = false;
+    const f32 BG_DARKNESS = 0.f;
+
+    f32 zoom = 1.0f;
+    const f32 ZOOM_MIN = 0.25f, ZOOM_MAX = __FLT_MAX__, ZOOM_STEP = 1.1f;
+
     sf::ContextSettings ctx;
     ctx.antiAliasingLevel = 16;
     sf::RenderWindow win(
-        sf::VideoMode({ 1280u, 800u }), "koch", sf::Style::Default, sf::State::Windowed, ctx
+        sf::VideoMode({ 1280u, 800u }),
+        "RECREATIVE PROGRAMMING WINDOW",
+        sf::Style::Default,
+        sf::State::Windowed,
+        ctx
     );
     win.setFramerateLimit(144);
-
     backends::SfmlRenderer renderer(win);
 
     gfx::AABB vp;
@@ -74,78 +61,66 @@ int main() {
     vp.max = { 1280, 800 };
     gfx::PathStore store;
     gfx::Frame frame(vp, store);
-    frame.setArcTolerancePx(0.12f);
+    frame.setArcTolerancePx(ARC_TOLERANCE_PX);
 
-    int iterations = 6;
-    const float baseRadius = 250.f;
+    gfx::PathId polyId = store.add(makeRegularPolygon(POLY_SIDES));
 
-    std::vector<mu::Vec2f> fullPts = makeKochSnowflake({ 0, 0 }, baseRadius, iterations);
-
-    geom::Path dyn;
-    dyn.closed = true;
-    dyn.add(fullPts.front());
-    auto dynId = store.add(std::move(dyn));
-    size_t cursor = 1;
-
-    gfx::Pen ink{ Color{ 230, 245, 240, 255 }, 1.6f };
-    ink.join = gfx::LineJoin::Round;
-    ink.cap = gfx::LineCap::Round;
-
-    sf::Clock clock, stepClock;
-    float pointsPerSecond = 2500.f;
-
-    auto rebuildFlake = [&]() {
-        fullPts = makeKochSnowflake({ 0, 0 }, baseRadius, iterations);
-        if (auto* p = store.getMutable(dynId)) {
-            p->clear();
-            p->closed = true;
-            p->add(fullPts.front());
-            cursor = 1;
-            frame.markPathDirty(dynId);
-        }
+    auto mkPen = [&](Color c) {
+        gfx::Pen p{ c, STROKE_PX / BASE_SCALE_PX };
+        p.cap = gfx::LineCap::Butt;
+        p.join = gfx::LineJoin::Miter;
+        p.miterLimit = 6.0f;
+        return p;
     };
+
+    std::vector<gfx::Pen> pens;
+    pens.reserve(INSTANCES);
+    for (i32 i = 0; i < INSTANCES; ++i) {
+        if (!USE_GRADIENT) {
+            pens.push_back(mkPen({ 255, 255, 255, 255 }));
+        } else {
+            f32 u = (f32)i / std::max(1, INSTANCES - 1);
+            u = std::pow(u, 0.7f);
+            u8 v = (u8)std::round(220.f * (1.f - u));
+            pens.push_back(mkPen({ v, v, v, 255 }));
+        }
+    }
+
+    sf::Clock clk;
 
     while (win.isOpen()) {
         while (const std::optional ev = win.pollEvent()) {
             if (ev->is<sf::Event::Closed>()) win.close();
-            if (const auto* rsz = ev->getIf<sf::Event::Resized>()) {
-                (void)rsz;
+            if (const auto* r = ev->getIf<sf::Event::Resized>()) {
                 auto sz = win.getSize();
-                vp.max = { (float)sz.x, (float)sz.y };
+                vp.max = { (f32)sz.x, (f32)sz.y };
             }
-            if (const auto* kp = ev->getIf<sf::Event::KeyPressed>()) {
-                if (kp->scancode == sf::Keyboard::Scancode::R) rebuildFlake();
-                if (kp->scancode == sf::Keyboard::Scancode::Up) {
-                    iterations = std::min(6, iterations + 1);
-                    rebuildFlake();
-                }
-                if (kp->scancode == sf::Keyboard::Scancode::Down) {
-                    iterations = std::max(2, iterations - 1);
-                    rebuildFlake();
+            if (const auto* w = ev->getIf<sf::Event::MouseWheelScrolled>()) {
+                f32 factor = std::pow(ZOOM_STEP, w->delta);
+                zoom = mu::clamp(zoom * factor, ZOOM_MIN, ZOOM_MAX);
+            }
+            if (const auto* k = ev->getIf<sf::Event::KeyPressed>()) {
+                if (k->scancode == sf::Keyboard::Scancode::Space) {
+                    zoom = 1.0f;
+                    clk.restart();
                 }
             }
         }
 
-        float dt = stepClock.restart().asSeconds();
-        if (cursor < fullPts.size()) {
-            int n = std::max(1, (int)std::floor(pointsPerSecond * dt));
-            n = std::min<int>(n, (int)fullPts.size() - (int)cursor);
-            if (auto* p = store.getMutable(dynId)) {
-                for (int i = 0; i < n; ++i)
-                    p->add(fullPts[cursor++]);
-                frame.markPathDirty(dynId);
-            }
-        }
+        const f32 t = clk.getElapsedTime().asSeconds();
+        const f32 globRot = GLOBAL_ROT_SPEED * t;
+        const mu::Vec2f center{ vp.max.x * 0.5f, vp.max.y * 0.5f };
 
-        win.clear(sf::Color(18, 18, 22));
+        win.clear(sf::Color(BG_DARKNESS, BG_DARKNESS, BG_DARKNESS));
         frame.clear();
 
-        float t = clock.getElapsedTime().asSeconds();
-        float s = 0.985f + 0.015f * std::sin(t * 0.6f);
-        float rdeg = 4.f * std::sin(t * 0.2f);
-        auto M = composeTRS({ vp.max.x * 0.5f, vp.max.y * 0.52f }, rdeg, { s, s });
+        for (i32 i = INSTANCES - 1; i >= 0; --i) {
+            f32 s = BASE_SCALE_PX * std::pow(SCALE_RATIO, (f32)i) * zoom;
+            f32 rot = globRot + ROT_STEP_DEG * (f32)i;
 
-        frame.addStroke(dynId, ink, M);
+            frame.addStroke(polyId, pens[i], composeTRS(center, rot, { s, s }));
+        }
+
         frame.rasterize(renderer);
         win.display();
     }

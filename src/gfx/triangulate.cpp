@@ -14,8 +14,6 @@ static StrokeParams toParams(const Pen& pen, float arcTolPx) {
     return sp;
 }
 
-// Nombre de segments pour approximer un arc de rayon r et angle theta
-// avec une erreur de flèche (sagitta) <= tol (pixels).
 static int segmentsForArc(float r, float theta, float tol, int minSeg = 6, int maxSeg = 256) {
     theta = std::fabs(theta);
     r = std::max(r, 1e-6f);
@@ -43,6 +41,10 @@ Mesh Triangulator::buildStrokeMesh(const Path& P, const StrokeParams& sp) {
 
     const f32 hw = sp.width * 0.5f;
     const size_t N = P.pts.size();
+
+    // --------- STORE: REDUCE MASSIVE REALLOC ---------
+    // Base: 2 sort/segment (6 verts) + offset caps/joins
+    M.verts.reserve(static_cast<size_t>(8 * (N - 1) + 256));
 
     std::vector<Vec2f> dir(N);
     std::vector<Vec2f> nrm(N);
@@ -163,18 +165,25 @@ Mesh Triangulator::buildStrokeMesh(const Path& P, const StrokeParams& sp) {
         addTri(M, aR, bL, bR);
     };
 
+    // ---- segments + joins ----
     if (!P.closed) emitCap(P.pts.front(), dir[0], nrm[0], /*start*/ true);
 
+    // segs (0..N-2)
     for (size_t i = 0; i < N - 1; ++i) {
         emitSegment(P.pts[i], P.pts[i + 1], nrm[i], nrm[i]);
         if (i < N - 2) {
             emitJoin(P.pts[i + 1], nrm[i], nrm[i + 1], dir[i], dir[i + 1]);
-        } else if (P.closed) {
-            emitJoin(P.pts[0], nrm[N - 1], nrm[0], dir[N - 1], dir[0]);
         }
     }
 
-    if (!P.closed) emitCap(P.pts.back(), dir[N - 2], nrm[N - 2], /*start*/ false);
+    if (P.closed) {
+        // <<< FIX >>> closure
+        emitSegment(P.pts[N - 1], P.pts[0], nrm[N - 1], nrm[0]);
+        emitJoin(P.pts[0], nrm[N - 1], nrm[0], dir[N - 1], dir[0]);
+    } else {
+        emitCap(P.pts.back(), dir[N - 2], nrm[N - 2], /*start*/ false);
+    }
+
     return M;
 }
 

@@ -6,180 +6,164 @@
 ```cpp
 #include "backends/sfml_renderer.hpp"
 #include "core/styles.hpp"
-#include "core/types.hpp"
 #include "geom/path.hpp"
 #include "gfx/frame.hpp"
-#include "turtle/turtle.hpp"
 #include <SFML/Graphics.hpp>
-#include <algorithm>
 #include <cmath>
-#include <functional>
+#include <optional>
 #include <vector>
 
-// -------- helpers maths --------
-static mu::Vec2f rotDeg(const mu::Vec2f& v, float deg) {
-    return mu::rotate(v, deg);
-}
-static mu::Vec2f operator+(mu::Vec2f a, mu::Vec2f b) {
-    return { a.x + b.x, a.y + b.y };
-}
-static mu::Vec2f operator-(mu::Vec2f a, mu::Vec2f b) {
-    return { a.x - b.x, a.y - b.y };
-}
-static mu::Vec2f operator*(mu::Vec2f a, float s) {
-    return { a.x * s, a.y * s };
-}
-static mu::Vec2f operator/(mu::Vec2f a, float s) {
-    return { a.x / s, a.y / s };
-}
-
-// Equilatéral CCW centré en c
-static std::vector<mu::Vec2f> makeEquilateral(mu::Vec2f c, float R) {
-    std::vector<mu::Vec2f> t(3);
-    t[0] = { c.x + R * std::cos(mu::deg2rad(-90.f)), c.y + R * std::sin(mu::deg2rad(-90.f)) };
-    t[1] = { c.x + R * std::cos(mu::deg2rad(30.f)), c.y + R * std::sin(mu::deg2rad(30.f)) };
-    t[2] = { c.x + R * std::cos(mu::deg2rad(150.f)), c.y + R * std::sin(mu::deg2rad(150.f)) };
-    return t;  // CCW
-}
-
-// Subdivision Koch pour un polygone fermé CCW (bump vers l'extérieur)
-// Pour chaque segment A->B : A, p1, p3, p2 ; (ne push pas B, on restera fermé via Path::closed)
-static std::vector<mu::Vec2f> kochSubdivide(const std::vector<mu::Vec2f>& in) {
-    std::vector<mu::Vec2f> out;
-    out.reserve(in.size() * 4);
-    const size_t N = in.size();
-    for (size_t i = 0; i < N; ++i) {
-        mu::Vec2f A = in[i];
-        mu::Vec2f B = in[(i + 1) % N];
-        mu::Vec2f AB = B - A;
-        mu::Vec2f p1 = A + AB / 3.f;
-        mu::Vec2f p2 = A + AB * (2.f / 3.f);
-        // pic équilatéral côté "extérieur" (= à droite de AB, donc rot -60°)
-        mu::Vec2f p3 = p1 + rotDeg(p2 - p1, -60.f);
-        out.push_back(A);
-        out.push_back(p1);
-        out.push_back(p3);
-        out.push_back(p2);
-        // B sera ajouté comme A du segment suivant
-    }
-    return out;
-}
-
-static std::vector<mu::Vec2f> makeKochSnowflake(mu::Vec2f center, float radius, int iterations) {
-    iterations = std::clamp(iterations, 0, 8);  // 3 * 4^8 points max
-    auto poly = makeEquilateral(center, radius);
-    for (int i = 0; i < iterations; ++i)
-        poly = kochSubdivide(poly);
-    return poly;  // sans point final dupliqué
-}
-
+// ---- utils ----
 static mu::Mat3f composeTRS(mu::Vec2f t, float rotDeg, mu::Vec2f s) {
     return mu::Mat3f::translation(t.x, t.y) * mu::Mat3f::rotation(rotDeg) *
            mu::Mat3f::scale(s.x, s.y);
 }
+static inline mu::Vec2f polar(float r, float th) {
+    return { r * std::cos(th), r * std::sin(th) };
+}
 
-// ---------------- main ----------------
+// ---- Archimède r = a + bθ, échantillonnage ds ≈ constant ----
+struct Spiral {
+    gfx::PathId id{};
+    float t{ 1e-4f };  // démarre > 0 pour éviter le point (0,0)
+    float a{ 0.f };
+    float b{ 0.01f };      // spacing entre spires = 2πb (en unités monde)
+    float phi{ 0.f };      // phase
+    float scale{ 100.f };  // monde -> pixels (appliqué dans la transform)
+    float stepPx{ 0.9f };  // longueur d’arc visée par point (px)
+    size_t maxPoints{ 20000 };
+    gfx::Pen pen{ Color{ 255, 255, 255, 255 }, 1.0f };  // width corrigée plus bas
+};
+
+static void stepSpiral(gfx::PathStore& store, gfx::Frame& frame, Spiral& s, int samples) {
+    auto* P = store.getMutable(s.id);
+    if (!P) return;
+
+    bool changed = false;
+    for (int i = 0; i < samples; ++i) {
+        const float r = s.a + s.b * s.t;
+        const float th = s.t + s.phi;
+        P->add(polar(r, th));
+        changed = true;
+
+        // ds = sqrt(r^2 + b^2) dθ  =>  dθ = ds_world / sqrt(r^2 + b^2)
+        const float ds_world = s.stepPx / s.scale;
+        const float dtheta = ds_world / std::sqrt(r * r + s.b * s.b);
+        s.t += dtheta;
+
+        if (P->pts.size() > s.maxPoints) {
+            geom::Path tail;
+            tail.closed = false;
+            tail.pts.reserve(s.maxPoints);
+            for (size_t k = P->pts.size() - s.maxPoints; k < P->pts.size(); ++k)
+                tail.add(P->pts[k]);
+            *P = std::move(tail);
+        }
+    }
+    if (changed) frame.markPathDirty(s.id);
+}
+
 int main() {
+    // Fenêtre
     sf::ContextSettings ctx;
     ctx.antiAliasingLevel = 16;
     sf::RenderWindow win(
-        sf::VideoMode({ 1280u, 800u }),
-        "Fractale de Koch — dessin progressif",
-        sf::Style::Default,
-        sf::State::Windowed,
-        ctx
+        sf::VideoMode({ 1280u, 800u }), "Spirales 4", sf::Style::Default, sf::State::Windowed, ctx
     );
     win.setFramerateLimit(144);
-
     backends::SfmlRenderer renderer(win);
 
+    // Pipeline
     gfx::AABB vp;
     vp.min = { 0, 0 };
     vp.max = { 1280, 800 };
     gfx::PathStore store;
     gfx::Frame frame(vp, store);
-    frame.setArcTolerancePx(0.12f);
+    frame.setArcTolerancePx(0.14f);
 
-    // Paramètres fractale
-    int iterations = 6;              // 2..6 pour rester réactif
-    const float baseRadius = 250.f;  // taille avant transform finale
+    // Paramètres — spacing voulu (en px) => b en monde
+    const float scale = 105.f;     // px par unité monde
+    const float spacingPx = 20.f;  // distance entre spires à l’écran
+    const float base_b = spacingPx / (scale * 2.f * mu::PI);
 
-    // Points source complets pour la fractale
-    std::vector<mu::Vec2f> fullPts = makeKochSnowflake({ 0, 0 }, baseRadius, iterations);
+    auto makeEmptyPath = [&]() {
+        geom::Path P;
+        P.closed = false;
+        return store.add(std::move(P));
+    };
 
-    // Path dynamique qui se remplit
-    geom::Path dyn;
-    dyn.closed = true;
-    dyn.add(fullPts.front());
-    auto dynId = store.add(std::move(dyn));
-    size_t cursor = 1;
+    // Stylos (width en unités monde = 1/scale => 1 px à l’écran)
+    auto mkPen = [&](Color c) {
+        gfx::Pen p{ c, 1.0f / scale };
+        p.cap = gfx::LineCap::Round;
+        p.join = gfx::LineJoin::Round;
+        return p;
+    };
 
-    // Style de trait
-    gfx::Pen ink{ Color{ 230, 245, 240, 255 }, 1.6f };
-    ink.join = gfx::LineJoin::Round;
-    ink.cap = gfx::LineCap::Round;
+    // 4 spirales déphasées + b légèrement différents
+    f32 base_acc = 1.00f;
+    u8 base_color = 0;
+    std::vector<Spiral> S;
+    for (size_t i = 0; i < 20; i++) {
+        Spiral a = Spiral{ makeEmptyPath(), 1e-4f, 0.f,   base_b * base_acc,           0.f,
+                           scale,           0.9f,  22000, mkPen({ 20, 200, 160, 255 }) };
+        base_acc += 0.10f;
+        base_color += 20;
+        S.push_back(a);
+    }
 
-    // Animation temps-réel
-    sf::Clock clock, stepClock;
-    float pointsPerSecond = 2500.f;  // vitesse d’apparition (points/s)
+    sf::Clock clock, step;
+    float samplesPerSec = 250.f;
 
-    auto rebuildFlake = [&]() {
-        fullPts = makeKochSnowflake({ 0, 0 }, baseRadius, iterations);
-        if (auto* p = store.getMutable(dynId)) {
-            p->clear();
-            p->closed = true;
-            p->add(fullPts.front());
-            cursor = 1;
-            frame.markPathDirty(dynId);
+    auto resetAll = [&]() {
+        for (auto& s : S) {
+            if (auto* P = store.getMutable(s.id)) {
+                P->clear();
+                P->closed = false;
+            }
+            s.t = 1e-4f;
+            frame.markPathDirty(s.id);
         }
     };
 
     while (win.isOpen()) {
         while (const std::optional ev = win.pollEvent()) {
             if (ev->is<sf::Event::Closed>()) win.close();
-            if (const auto* rsz = ev->getIf<sf::Event::Resized>()) {
-                (void)rsz;
+            if (const auto* r = ev->getIf<sf::Event::Resized>()) {
+                (void)r;
                 auto sz = win.getSize();
                 vp.max = { (float)sz.x, (float)sz.y };
             }
-            if (const auto* kp = ev->getIf<sf::Event::KeyPressed>()) {
-                if (kp->scancode == sf::Keyboard::Scancode::R) {
-                    rebuildFlake();
-                }
-                if (kp->scancode == sf::Keyboard::Scancode::Up) {
-                    iterations = std::min(6, iterations + 1);
-                    rebuildFlake();
-                }
-                if (kp->scancode == sf::Keyboard::Scancode::Down) {
-                    iterations = std::max(2, iterations - 1);
-                    rebuildFlake();
-                }
+            if (const auto* k = ev->getIf<sf::Event::KeyPressed>()) {
+                if (k->scancode == sf::Keyboard::Scancode::R) resetAll();
             }
         }
 
-        // Avancement progressif
-        float dt = stepClock.restart().asSeconds();
-        if (cursor < fullPts.size()) {
-            int n = std::max(1, (int)std::floor(pointsPerSecond * dt));
-            n = std::min<int>(n, (int)fullPts.size() - (int)cursor);
-            if (auto* p = store.getMutable(dynId)) {
-                for (int i = 0; i < n; ++i)
-                    p->add(fullPts[cursor++]);
-                frame.markPathDirty(dynId);
-            }
-        }
+        const float dt = step.restart().asSeconds();
+        const int emit = std::max(1, (int)std::floor(samplesPerSec * dt));
+        for (auto& s : S)
+            stepSpiral(store, frame, s, emit);
 
         // Rendu
         win.clear(sf::Color(18, 18, 22));
         frame.clear();
 
-        // petite respiration + rotation lente
-        float t = clock.getElapsedTime().asSeconds();
-        float s = 0.985f + 0.015f * std::sin(t * 0.6f);
-        float rdeg = 4.f * std::sin(t * 0.2f);
-        auto M = composeTRS({ vp.max.x * 0.5f, vp.max.y * 0.52f }, rdeg, { s, s });
+        const float t = clock.getElapsedTime().asSeconds();
+        const float breath = 1.0f + 0.01f * std::sin(t * 0.7f);
+        const float rot = 5.f * std::sin(t * 0.15f);
 
-        frame.addStroke(dynId, ink, M);
+        for (const auto& s : S) {
+            frame.addStroke(
+                s.id,
+                s.pen,
+                composeTRS(
+                    { vp.max.x * 0.5f, vp.max.y * 0.52f },
+                    rot,
+                    { s.scale * breath, s.scale * breath }
+                )
+            );
+        }
+
         frame.rasterize(renderer);
         win.display();
     }

@@ -22,7 +22,7 @@ struct DrawOp {
     OpKind kind{ OpKind::StrokePath };
     PathId path;
     Pen pen;
-    // Transform locale (optionnel) — pour SFML on appliquera CPU
+    // Transform locale (optionnel) — désormais appliquée par le backend (GPU)
     mu::Mat3f local = mu::Mat3f::identity();
     AABB aabb;  // aabb transformée (pour culling rapide)
 };
@@ -36,7 +36,11 @@ struct Mesh {
 /// Interface backend (retenue simple)
 struct IRenderer {
     virtual ~IRenderer() = default;
-    virtual void drawMeshes(const std::vector<Mesh>& meshes, std::optional<Pen> overridePen) = 0;
+
+    // NOTE: nouvelle signature — on passe la transform locale à appliquer GPU-side
+    virtual void drawMeshes(
+        const std::vector<Mesh>& meshes, std::optional<Pen> overridePen, const mu::Mat3f& local
+    ) = 0;
 };
 
 }  // namespace gfx
