@@ -37,7 +37,7 @@ struct Pen {
     std::vector<f32> dash;
 
     /// @brief Convenience constructor for a solid pen.
-    constexpr Pen(Color c, f32 w) : width(w), color(c) {
+    Pen(Color c, f32 w) : width(w), color(c) {
     }
 
     /// @brief Default constructor.

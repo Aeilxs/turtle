@@ -1,0 +1,34 @@
+#pragma once
+#include "gfx/draw.hpp"
+#include <SFML/Graphics.hpp>
+
+namespace backends {
+
+class SfmlRenderer final : public gfx::IRenderer {
+   public:
+    explicit SfmlRenderer(sf::RenderTarget& tgt) : tgt_(tgt) {
+    }
+
+    void drawMeshes(const std::vector<gfx::Mesh>& meshes, std::optional<gfx::Pen> overridePen)
+        override {
+        if (!overridePen) return;
+        sf::Color col(
+            overridePen->color.r, overridePen->color.g, overridePen->color.b, overridePen->color.a
+        );
+
+        for (const auto& m : meshes) {
+            if (m.verts.empty()) continue;
+            sf::VertexArray va(sf::PrimitiveType::Triangles, m.verts.size());
+            for (size_t i = 0; i < m.verts.size(); ++i) {
+                va[i].position = { m.verts[i].x, m.verts[i].y };
+                va[i].color = col;
+            }
+            tgt_.draw(va);
+        }
+    }
+
+   private:
+    sf::RenderTarget& tgt_;
+};
+
+}  // namespace backends

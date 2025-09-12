@@ -4,29 +4,234 @@
 
 - `main.cpp`
 ```cpp
+#include "backends/sfml_renderer.hpp"
+#include "core/styles.hpp"
 #include "core/types.hpp"
+#include "geom/path.hpp"
+#include "gfx/frame.hpp"
+#include "turtle/turtle.hpp"
 #include <SFML/Graphics.hpp>
+#include <cmath>
+#include <optional>
 
-i32 main() {
-    auto window = sf::RenderWindow(sf::VideoMode({ 1920u, 1080u }), "CMake SFML Project");
-    window.setFramerateLimit(144);
+// --------------------- helpers (local to main.cpp) ---------------------
 
-    while (window.isOpen()) {
-        while (const std::optional event = window.pollEvent()) {
-            if (event->is<sf::Event::Closed>()) {
-                window.close();
+static geom::Path makeParametric(
+    std::function<mu::Vec2f(float)> f, float t0, float t1, int samples, bool closed = true
+) {
+    geom::Path P;
+    P.closed = closed;
+    P.pts.reserve(samples);
+    const float dt = (t1 - t0) / (float)samples;
+    for (int i = 0; i < samples; ++i)
+        P.add(f(t0 + dt * i));
+    return P;
+}
+
+static geom::Path makeHypotrochoid(mu::Vec2f c, float R, float r, float d, int samples) {
+    // (R - r) * cos t + d * cos((R - r)/r * t), same for sin
+    float k = (R - r) / r;
+    return makeParametric(
+        [=](float t) {
+            float ct = std::cos(t), st = std::sin(t);
+            float ck = std::cos(k * t), sk = std::sin(k * t);
+            return mu::Vec2f{ c.x + (R - r) * ct + d * ck, c.y + (R - r) * st - d * sk };
+        },
+        0.f,
+        2.f * mu::PI * r / std::gcd((int)std::round(R), (int)std::round(r)),
+        samples,
+        true
+    );
+}
+
+static geom::Path makeRose(mu::Vec2f c, float a, float k, int samples) {
+    // r = a * cos(k t)
+    return makeParametric(
+        [=](float t) {
+            float r = a * std::cos(k * t);
+            return mu::Vec2f{ c.x + r * std::cos(t), c.y + r * std::sin(t) };
+        },
+        0.f,
+        2.f * mu::PI,
+        samples,
+        true
+    );
+}
+
+static geom::Path makeLissajous(
+    mu::Vec2f c, float ax, float ay, float A, float B, float delta, int samples
+) {
+    // x = ax + A * sin(a t + δ), y = ay + B * sin(b t)
+    return makeParametric(
+        [=](float t) {
+            return mu::Vec2f{ c.x + A * std::sin(A * t + delta), c.y + B * std::sin(B * t) };
+        },
+        0.f,
+        2.f * mu::PI,
+        samples,
+        true
+    );
+}
+
+static mu::Mat3f composeTRS(mu::Vec2f t, float rotDeg, mu::Vec2f s) {
+    return mu::Mat3f::translation(t.x, t.y) * mu::Mat3f::rotation(rotDeg) *
+           mu::Mat3f::scale(s.x, s.y);
+}
+
+static void addNeonStroke(
+    gfx::Frame& frame,
+    gfx::PathId id,
+    Color base,
+    float coreWidth,
+    int layers,
+    float spread,
+    gfx::LineJoin join = gfx::LineJoin::Round,
+    gfx::LineCap cap = gfx::LineCap::Round,
+    const mu::Mat3f& M = mu::Mat3f::identity()
+) {
+    // Outer glow layers (large, faint) → inner (small, brighter) → core
+    for (int i = layers; i >= 1; --i) {
+        float t = (float)i / (float)layers;
+        gfx::Pen p{ base, coreWidth + spread * t * t };  // quadratic spread
+        p.color.a = (u8)std::round(14 * t);              // faint alpha
+        p.join = join;
+        p.cap = cap;
+        frame.addStroke(id, p, M);
+    }
+    gfx::Pen core{ base, coreWidth };
+    core.join = join;
+    core.cap = cap;
+    frame.addStroke(id, core, M);
+}
+
+// ------------------------------- main ---------------------------------
+
+int main() {
+    // MSAA context (works with your current simple renderer as well)
+    sf::ContextSettings ctx;
+    ctx.antialiasingLevel = 8;
+    sf::RenderWindow win(
+        sf::VideoMode({ 1280u, 800u }),
+        "RECREATIVE PROGRAMMING WINDOW",
+        sf::Style::Default,
+        sf::State::Windowed,
+        ctx
+    );
+    win.setFramerateLimit(144);
+
+    backends::SfmlRenderer renderer(win);
+
+    gfx::AABB vp;
+    vp.min = { 0, 0 };
+    vp.max = { 1280, 800 };
+    gfx::PathStore store;
+    gfx::Frame frame(vp, store);
+
+    // ---------- geometry (retained) ----------
+    // Big hypotrochoid (left)
+    auto hypotroId =
+        store.add(makeHypotrochoid({ 0, 0 }, /*R*/ 260.f, /*r*/ 61.f, /*d*/ 92.f, /*samples*/ 3800)
+        );
+
+    // Rose curve (center-top)
+    auto roseId = store.add(makeRose({ 0, 0 }, /*a*/ 150.f, /*k*/ 2.5f, /*samples*/ 3000));
+
+    // Lissajous (right)
+    auto lisId = store.add(makeParametric(
+        [](float t) {
+            return mu::Vec2f{ 0.f + 160.f * std::sin(3.f * t + mu::PI / 3.f),
+                              0.f + 110.f * std::sin(2.f * t) };
+        },
+        0.f,
+        2.f * mu::PI,
+        2600,
+        true
+    ));
+
+    // ---------- styling ----------
+    Color teal{ 20, 200, 160, 255 };
+    Color magenta{ 235, 30, 115, 255 };
+    Color amber{ 255, 180, 40, 255 };
+
+    sf::Clock clock;
+
+    while (win.isOpen()) {
+        while (const std::optional event = win.pollEvent()) {
+            if (event->is<sf::Event::Closed>()) win.close();
+            if (const auto* r = event->getIf<sf::Event::Resized>()) {
+                (void)r;
+                auto sz = win.getSize();
+                vp.max = { (float)sz.x, (float)sz.y };
             }
         }
 
-        window.clear();
-        window.display();
+        win.clear(sf::Color(18, 18, 22));
+
+        // time
+        float t = clock.getElapsedTime().asSeconds();
+
+        // ---------- compose scene ----------
+        frame.clear();
+
+        // Left: Hypotrochoid neon, gentle rotation + breathing scale
+        {
+            float rot = std::sin(t * 0.35f) * 12.f;
+            float s = 0.98f + 0.02f * std::sin(t * 0.9f);
+            auto M = composeTRS({ 360.f, 430.f }, rot, { s, s });
+            addNeonStroke(
+                frame,
+                hypotroId,
+                teal,
+                /*core*/ 3.2f,
+                /*layers*/ 6,
+                /*spread*/ 28.f,
+                gfx::LineJoin::Round,
+                gfx::LineCap::Round,
+                M
+            );
+        }
+
+        // Center-top: Rose curve, slow drift and rotation the other way
+        {
+            float rot = -std::sin(t * 0.25f) * 25.f;
+            float s = 0.9f + 0.05f * std::sin(t * 0.6f + 1.2f);
+            auto M = composeTRS({ 800.f, 240.f + 10.f * std::sin(t * 0.7f) }, rot, { s, s });
+            addNeonStroke(
+                frame,
+                roseId,
+                magenta,
+                /*core*/ 6.0f,
+                /*layers*/ 8,
+                /*spread*/ 36.f,
+                gfx::LineJoin::Round,
+                gfx::LineCap::Round,
+                M
+            );
+        }
+
+        // Right: Lissajous, subtle wobble
+        {
+            float rot = 10.f * std::sin(t * 0.5f + 0.8f);
+            float s = 1.0f + 0.03f * std::sin(t * 0.8f + 2.2f);
+            auto M = composeTRS({ 980.f, 500.f }, rot, { s, s });
+            addNeonStroke(
+                frame,
+                lisId,
+                amber,
+                /*core*/ 5.0f,
+                /*layers*/ 7,
+                /*spread*/ 30.f,
+                gfx::LineJoin::Round,
+                gfx::LineCap::Round,
+                M
+            );
+        }
+
+        // Rasterize & present
+        frame.rasterize(renderer);
+        win.display();
     }
 }
-
-```
-
-- `core/geom.hpp`
-```cpp
 
 ```
 
@@ -191,7 +396,7 @@ struct Pen {
     std::vector<f32> dash;
 
     /// @brief Convenience constructor for a solid pen.
-    constexpr Pen(Color c, f32 w) : width(w), color(c) {
+    Pen(Color c, f32 w) : width(w), color(c) {
     }
 
     /// @brief Default constructor.
@@ -208,11 +413,6 @@ struct Pen {
 };
 
 }  // namespace gfx
-
-```
-
-- `core/geom.cpp`
-```cpp
 
 ```
 
@@ -391,90 +591,739 @@ Vec2f Mat3f::transformPoint(const Vec2f& v) const noexcept {
 
 ```
 
-
-## tests
-
-- `mu_tests.cpp`
+- `turtle/turtle.hpp`
 ```cpp
+#pragma once
+#include "core/styles.hpp"
+#include "core/types.hpp"
+#include "geom/path.hpp"
+
+namespace turtle {
+
+using geom::Path;
+using mu::f32;
+using mu::Vec2f;
+
+class Turtle {
+   public:
+    void setPos(Vec2f p) {
+        pos_ = p;
+    }
+    Vec2f pos() const {
+        return pos_;
+    }
+
+    void setHeading(f32 deg) {
+        heading_ = deg;
+    }
+    f32 heading() const {
+        return heading_;
+    }
+
+    void penUp() {
+        down_ = false;
+    }
+    void penDown() {
+        down_ = true;
+    }
+    bool isDown() const {
+        return down_;
+    }
+
+    void setPen(const gfx::Pen& p) {
+        pen_ = p;
+    }
+    const gfx::Pen& pen() const {
+        return pen_;
+    }
+
+    void beginPath() {
+        path_.clear();
+        path_.add(pos_);
+    }
+    Path endPath(bool close = false) {
+        path_.closed = close;
+        return path_;
+    }
+
+    void forward(f32 d) {
+        auto dir = mu::rotate(Vec2f{ 1.f, 0.f }, heading_);
+        Vec2f dst{ pos_.x + dir.x * d, pos_.y + dir.y * d };
+        pos_ = dst;
+        if (down_) path_.add(pos_);
+    }
+    void left(f32 deg) {
+        heading_ += deg;
+    }
+    void right(f32 deg) {
+        heading_ -= deg;
+    }
+
+   private:
+    Vec2f pos_{ 0.f, 0.f };
+    f32 heading_{ 0.f };
+    bool down_{ true };
+    gfx::Pen pen_{ Color{ 255, 255, 255, 255 }, 2.f };
+    Path path_;
+};
+
+}  // namespace turtle
+
+```
+
+- `backends/sfml_renderer.hpp`
+```cpp
+#pragma once
+#include "gfx/draw.hpp"
+#include <SFML/Graphics.hpp>
+#include <memory>
+
+namespace backends {
+
+/// Renderer SFML avec supersampling + MSAA
+class SfmlRenderer final : public gfx::IRenderer {
+   public:
+    struct Options {
+        int supersample = 2;  // 1 = off
+        unsigned msaa = 8;    // anti-aliasing du contexte
+        sf::Color clear{ 18, 18, 22, 255 };
+    };
+
+    explicit SfmlRenderer(sf::RenderWindow& win, Options opt = {}) : win_(win), opt_(opt) {
+        if (opt_.supersample < 1) opt_.supersample = 1;
+        recreateRtIfNeeded();
+        if (rt_) rt_->setSmooth(true);
+    }
+
+    // À appeler en début de frame
+    void beginFrame() {
+        recreateRtIfNeeded();
+        if (rt_)
+            rt_->clear(opt_.clear);
+        else
+            win_.clear(opt_.clear);
+    }
+
+    // IRenderer
+    void drawMeshes(const std::vector<gfx::Mesh>& meshes, std::optional<gfx::Pen> overridePen)
+        override {
+        if (!overridePen.has_value()) return;
+        sf::Color col(
+            overridePen->color.r, overridePen->color.g, overridePen->color.b, overridePen->color.a
+        );
+        sf::RenderTarget& tgt =
+            rt_ ? static_cast<sf::RenderTarget&>(*rt_) : static_cast<sf::RenderTarget&>(win_);
+
+        const float S = float(opt_.supersample);
+        for (auto& m : meshes) {
+            if (m.verts.empty()) continue;
+            sf::VertexArray va(sf::PrimitiveType::Triangles, m.verts.size());
+            for (size_t i = 0; i < m.verts.size(); ++i) {
+                va[i].position = { m.verts[i].x * S, m.verts[i].y * S };
+                va[i].color = col;
+            }
+            tgt.draw(va);
+        }
+    }
+
+    // À appeler en fin de frame (après rasterize)
+    void endFrame() {
+        if (rt_) {
+            rt_->display();
+            sf::Sprite blit(rt_->getTexture());
+            const float invS = 1.f / float(opt_.supersample);
+            blit.setScale(invS, invS);
+            blit.setPosition(0.f, 0.f);
+            win_.draw(blit);
+        }
+        // win_.display() reste côté main loop
+    }
+
+    void onResize() {
+        recreateRtIfNeeded(true);
+    }
+
+   private:
+    sf::RenderWindow& win_;
+    Options opt_;
+    std::unique_ptr<sf::RenderTexture> rt_;
+
+    void recreateRtIfNeeded(bool force = false) {
+        if (opt_.supersample <= 1) {
+            rt_.reset();
+            return;
+        }
+        auto sz = win_.getSize();
+        sf::Vector2u need{ sz.x * (unsigned)opt_.supersample, sz.y * (unsigned)opt_.supersample };
+        if (!rt_ || force || rt_->getSize() != need) {
+            sf::ContextSettings s;
+            s.antialiasingLevel = opt_.msaa;
+            rt_ = std::make_unique<sf::RenderTexture>();
+            rt_->create(need, s);
+            rt_->setSmooth(true);
+        }
+    }
+};
+
+}  // namespace backends
+
+```
+
+- `backends/sfml_renderer.cpp`
+```cpp
+#include "backends/sfml_renderer.hpp"
+
+```
+
+- `geom/path.hpp`
+```cpp
+#pragma once
 #include "core/mu.hpp"
-#include <catch2/catch_all.hpp>
+#include "core/types.hpp"
+#include <cstdint>
+#include <vector>
 
-using Catch::Approx;
+namespace geom {
 
-TEST_CASE("Vec2f basic operators") {
-    mu::Vec2f a{ 1.f, 2.f };
-    mu::Vec2f b{ 3.f, 4.f };
+using mu::Mat3f;
+using mu::Vec2f;
 
-    SECTION("addition and subtraction") {
-        auto c = a + b;  // {4,6}
-        auto d = b - a;  // {2,2}
-        REQUIRE(c == mu::Vec2f{ 4.f, 6.f });
-        REQUIRE(d == mu::Vec2f{ 2.f, 2.f });
+struct AABB {
+    Vec2f min{ +1e9f, +1e9f };  // yes magic numbers i don't give a fuck
+    Vec2f max{ -1e9f, -1e9f };
+    void expand(Vec2f p) {
+        if (p.x < min.x) min.x = p.x;
+        if (p.y < min.y) min.y = p.y;
+        if (p.x > max.x) max.x = p.x;
+        if (p.y > max.y) max.y = p.y;
+    }
+    bool overlaps(const AABB& o) const {
+        return !(max.x < o.min.x || o.max.x < min.x || max.y < o.min.y || o.max.y < min.y);
+    }
+};
+
+/// Path = polyline (points consécutifs), éventuellement fermé.
+struct Path {
+    std::vector<Vec2f> pts;
+    bool closed{ false };
+    AABB bounds;
+    void clear() {
+        pts.clear();
+        closed = false;
+        bounds = {};
+    }
+    void add(Vec2f p) {
+        pts.push_back(p);
+        bounds.expand(p);
+    }
+};
+
+inline Path makeRect(Vec2f p, Vec2f s, bool closed = true) {
+    Path r;
+    r.closed = closed;
+    r.add({ p.x, p.y });
+    r.add({ p.x + s.x, p.y });
+    r.add({ p.x + s.x, p.y + s.y });
+    r.add({ p.x, p.y + s.y });
+    return r;
+}
+
+inline Path makeCircle(Vec2f c, f32 radius, int segments = 96, bool closed = true) {
+    Path P;
+    P.closed = closed;
+    for (int i = 0; i < segments; ++i) {
+        f32 t = 360.f * (f32)i / (f32)segments;
+        auto v = mu::rotate({ radius, 0.f }, t);
+        P.add({ c.x + v.x, c.y + v.y });
+    }
+    return P;
+}
+
+inline Path transform(const Path& src, const Mat3f& M) {
+    Path out;
+    out.closed = src.closed;
+    out.pts.reserve(src.pts.size());
+    for (auto& p : src.pts) {
+        auto q = M.transformPoint(p);
+        out.add(q);
+    }
+    return out;
+}
+
+}  // namespace geom
+
+```
+
+- `gfx/frame.cpp`
+```cpp
+#include "gfx/frame.hpp"
+
+namespace gfx {
+
+void Frame::rasterize(IRenderer& renderer) {
+    if (ops_.empty()) return;
+
+    // Batch par PenKey
+    std::unordered_map<PenKey, std::vector<const DrawOp*>, PenKeyHash> buckets;
+    buckets.reserve(ops_.size());
+    for (auto& op : ops_) {
+        if (op.kind != OpKind::StrokePath) continue;
+        buckets[PenKey{ op.pen }].push_back(&op);
     }
 
-    SECTION("scalar mul/div") {
-        auto s = a * 2.f;  // {2,4}
-        auto t = a / 2.f;  // {0.5,1}
-        REQUIRE(s == mu::Vec2f{ 2.f, 4.f });
-        REQUIRE(t == mu::Vec2f{ 0.5f, 1.f });
-    }
-
-    SECTION("length/dot/normalized") {
-        REQUIRE(mu::dot(a, b) == Approx(11.f).margin(1e-6));
-        REQUIRE(mu::length(mu::Vec2f{ 3.f, 4.f }) == Approx(5.f).margin(1e-6));
-
-        auto n = mu::normalized(mu::Vec2f{ 3.f, 4.f });
-        REQUIRE(mu::length(n) == Approx(1.f).margin(1e-6));
-        // direction preserved (sign)
-        REQUIRE(n.x > 0.f);
-        REQUIRE(n.y > 0.f);
+    // Pour chaque bucket, construire des Mesh (triangulation + transform CPU)
+    for (auto& [pkey, list] : buckets) {
+        std::vector<Mesh> meshes;
+        meshes.reserve(list.size());
+        for (auto* op : list) {
+            const auto* P = store_.get(op->path);
+            if (!P) continue;
+            const Mesh& base = tri_.stroke(*P, op->pen);
+            // copier + transformer CPU (local)
+            Mesh m;
+            m.verts.reserve(base.verts.size());
+            for (auto& v : base.verts) {
+                auto q = op->local.transformPoint(v);
+                m.verts.push_back(q);
+                m.aabb.expand(q);
+            }
+            meshes.push_back(std::move(m));
+        }
+        renderer.drawMeshes(meshes, pkey.pen);
     }
 }
 
-TEST_CASE("Angles and clamp") {
-    REQUIRE(mu::deg2rad(180.f) == Approx(mu::PI).margin(1e-6));
-    REQUIRE(mu::rad2deg(mu::PI) == Approx(180.f).margin(1e-6));
+}  // namespace gfx
 
-    REQUIRE(mu::clamp(5.f, 0.f, 10.f) == Approx(5.f).margin(1e-6));
-    REQUIRE(mu::clamp(-5.f, 0.f, 10.f) == Approx(0.f).margin(1e-6));
-    REQUIRE(mu::clamp(15.f, 0.f, 10.f) == Approx(10.f).margin(1e-6));
+```
+
+- `gfx/triangulate.cpp`
+```cpp
+#include "gfx/triangulate.hpp"
+#include <algorithm>
+#include <cmath>
+
+namespace gfx {
+
+static StrokeParams toParams(const Pen& pen, float arcTolPx) {
+    StrokeParams sp;
+    sp.width = std::max(0.f, pen.width);
+    sp.cap = pen.cap;
+    sp.join = pen.join;
+    sp.miterLimit = std::max(1.f, pen.miterLimit);
+    sp.arcTolPx = std::max(0.05f, arcTolPx);
+    return sp;
 }
 
-TEST_CASE("Mat3f transforms") {
-    using mu::Mat3f;
-    using mu::Vec2f;
-
-    SECTION("identity") {
-        auto I = Mat3f::identity();
-        REQUIRE(I.transformPoint(Vec2f{ 2.f, 3.f }) == Vec2f{ 2.f, 3.f });
-    }
-
-    SECTION("translation") {
-        auto T = Mat3f::translation(10.f, -2.f);
-        REQUIRE(T.transformPoint(Vec2f{ 1.f, 1.f }) == Vec2f{ 11.f, -1.f });
-    }
-
-    SECTION("scale") {
-        auto S = Mat3f::scale(2.f, 3.f);
-        REQUIRE(S.transformPoint(Vec2f{ 2.f, 2.f }) == Vec2f{ 4.f, 6.f });
-    }
-
-    SECTION("rotation 90 deg") {
-        auto R = Mat3f::rotation(90.f);
-        auto p = R.transformPoint(Vec2f{ 1.f, 0.f });
-        REQUIRE(p.x == Approx(0.f).margin(1e-6));
-        REQUIRE(p.y == Approx(1.f).margin(1e-6));
-    }
-
-    SECTION("composition R * T") {
-        auto R = Mat3f::rotation(90.f);
-        auto T = Mat3f::translation(2.f, 0.f);
-        auto M = R * T;
-        auto p = M.transformPoint(Vec2f{ 1.f, 0.f });  // (3,0) -> (0,3)
-        REQUIRE(p.x == Approx(0.f).margin(1e-6));
-        REQUIRE(p.y == Approx(3.f).margin(1e-6));
-    }
+// Nombre de segments pour approximer un arc de rayon r et angle theta
+// avec une erreur de flèche (sagitta) <= tol (pixels).
+static int segmentsForArc(float r, float theta, float tol, int minSeg = 6, int maxSeg = 256) {
+    theta = std::fabs(theta);
+    r = std::max(r, 1e-6f);
+    tol = std::max(tol, 1e-6f);
+    float x = 1.f - std::min(tol / r, 1.9f);
+    x = std::clamp(x, -1.f, 1.f);
+    float phi = 2.f * std::acos(x);
+    if (phi <= 1e-6f) phi = theta;
+    int n = int(std::ceil(theta / phi));
+    return std::max(minSeg, std::min(maxSeg, n));
 }
+
+const Mesh& Triangulator::stroke(const Path& P, const Pen& pen) {
+    MeshKey key{ &P, toParams(pen, arcTolPx_) };
+    auto it = cache_.find(key);
+    if (it != cache_.end()) return it->second;
+    auto mesh = buildStrokeMesh(P, key.sp);
+    auto [it2, _] = cache_.emplace(key, std::move(mesh));
+    return it2->second;
+}
+
+Mesh Triangulator::buildStrokeMesh(const Path& P, const StrokeParams& sp) {
+    Mesh M{};
+    if (P.pts.size() < 2 || sp.width <= 0.f) return M;
+
+    const f32 hw = sp.width * 0.5f;
+    const size_t N = P.pts.size();
+
+    std::vector<Vec2f> dir(N);
+    std::vector<Vec2f> nrm(N);
+    for (size_t i = 0; i < N - 1; ++i) {
+        auto d = Vec2f{ P.pts[i + 1].x - P.pts[i].x, P.pts[i + 1].y - P.pts[i].y };
+        auto nd = norm(d);
+        dir[i] = nd;
+        nrm[i] = perp(nd);
+    }
+    if (P.closed) {
+        auto d = Vec2f{ P.pts[0].x - P.pts[N - 1].x, P.pts[0].y - P.pts[N - 1].y };
+        auto nd = norm(d);
+        dir[N - 1] = nd;
+        nrm[N - 1] = perp(nd);
+    } else {
+        dir[N - 1] = dir[N - 2];
+        nrm[N - 1] = nrm[N - 2];
+    }
+
+    auto emitCap = [&](Vec2f p, Vec2f d, Vec2f n, bool start) {
+        if (sp.cap == LineCap::Butt) return;
+
+        if (sp.cap == LineCap::Square) {
+            Vec2f off = { d.x * hw * (start ? -1.f : +1.f), d.y * hw * (start ? -1.f : +1.f) };
+            Vec2f a = { p.x + off.x + n.x * hw, p.y + off.y + n.y * hw };
+            Vec2f b = { p.x + n.x * hw, p.y + n.y * hw };
+            Vec2f c = { p.x - n.x * hw, p.y - n.y * hw };
+            Vec2f d0 = { p.x + off.x - n.x * hw, p.y + off.y - n.y * hw };
+            addTri(M, a, b, c);
+            addTri(M, a, c, d0);
+            return;
+        }
+        if (sp.cap == LineCap::Round) {
+            int segs = segmentsForArc(hw, mu::PI, sp.arcTolPx, 10, 256);
+            float base = std::atan2(n.y, n.x) + (start ? mu::PI : 0.f);
+            Vec2f center = p;
+            Vec2f prev = { center.x + std::cos(base) * hw, center.y + std::sin(base) * hw };
+            float dirSign = start ? -1.f : +1.f;
+            for (int i = 1; i <= segs; ++i) {
+                float ang = base + dirSign * (mu::PI * (float)i / (float)segs);
+                Vec2f cur = { center.x + std::cos(ang) * hw, center.y + std::sin(ang) * hw };
+                addTri(M, center, prev, cur);
+                prev = cur;
+            }
+        }
+    };
+
+    auto emitJoin = [&](Vec2f p, Vec2f n0, Vec2f n1, Vec2f d0, Vec2f d1) {
+        float cross = d0.x * d1.y - d0.y * d1.x;
+        bool leftTurn = cross > 0.f;
+
+        if (sp.join == LineJoin::Bevel) {
+            Vec2f o0 = { p.x + n0.x * hw, p.y + n0.y * hw };
+            Vec2f o1 = { p.x + n1.x * hw, p.y + n1.y * hw };
+            addTri(M, p, o0, o1);
+            return;
+        }
+
+        if (sp.join == LineJoin::Round) {
+            float a0 = std::atan2(n0.y, n0.x);
+            float a1 = std::atan2(n1.y, n1.x);
+            auto normA = [&](float a) {
+                while (a < 0)
+                    a += 2 * mu::PI;
+                while (a >= 2 * mu::PI)
+                    a -= 2 * mu::PI;
+                return a;
+            };
+            a0 = normA(a0);
+            a1 = normA(a1);
+            float diff = leftTurn ? ((a1 >= a0) ? a1 - a0 : (a1 + 2 * mu::PI) - a0)
+                                  : ((a0 >= a1) ? a0 - a1 : (a0 + 2 * mu::PI) - a1);
+            int segs = segmentsForArc(hw, diff, sp.arcTolPx, 8, 192);
+            Vec2f prev = { p.x + n0.x * hw, p.y + n0.y * hw };
+            for (int i = 1; i <= segs; ++i) {
+                float ang =
+                    leftTurn ? (a0 + diff * (float)i / segs) : (a0 - diff * (float)i / segs);
+                Vec2f cur = { p.x + std::cos(ang) * hw, p.y + std::sin(ang) * hw };
+                addTri(M, p, prev, cur);
+                prev = cur;
+            }
+            return;
+        }
+
+        if (sp.join == LineJoin::Miter) {
+            Vec2f m = norm(Vec2f{ n0.x + n1.x, n0.y + n1.y });
+            float denom = dot(m, (leftTurn ? n1 : n0));
+            if (std::fabs(denom) < 1e-5f) {
+                Vec2f o0 = { p.x + n0.x * hw, p.y + n0.y * hw };
+                Vec2f o1 = { p.x + n1.x * hw, p.y + n1.y * hw };
+                addTri(M, p, o0, o1);
+                return;
+            }
+            float miterLen = hw / denom;
+            if (miterLen > sp.miterLimit * hw) {
+                Vec2f o0 = { p.x + n0.x * hw, p.y + n0.y * hw };
+                Vec2f o1 = { p.x + n1.x * hw, p.y + n1.y * hw };
+                addTri(M, p, o0, o1);
+                return;
+            }
+            Vec2f outer = { p.x + m.x * miterLen, p.y + m.y * miterLen };
+            Vec2f o0 = { p.x + n0.x * hw, p.y + n0.y * hw };
+            Vec2f o1 = { p.x + n1.x * hw, p.y + n1.y * hw };
+            addTri(M, o0, outer, o1);
+            Vec2f i0 = { p.x - n0.x * hw, p.y - n0.y * hw };
+            Vec2f i1 = { p.x - n1.x * hw, p.y - n1.y * hw };
+            addTri(M, p, i1, i0);
+            return;
+        }
+    };
+
+    auto emitSegment = [&](Vec2f a, Vec2f b, Vec2f nA, Vec2f nB) {
+        Vec2f aL = { a.x + nA.x * hw, a.y + nA.y * hw };
+        Vec2f aR = { a.x - nA.x * hw, a.y - nA.y * hw };
+        Vec2f bL = { b.x + nB.x * hw, b.y + nB.y * hw };
+        Vec2f bR = { b.x - nB.x * hw, b.y - nB.y * hw };
+        addTri(M, aL, bL, aR);
+        addTri(M, aR, bL, bR);
+    };
+
+    if (!P.closed) emitCap(P.pts.front(), dir[0], nrm[0], /*start*/ true);
+
+    for (size_t i = 0; i < N - 1; ++i) {
+        emitSegment(P.pts[i], P.pts[i + 1], nrm[i], nrm[i]);
+        if (i < N - 2) {
+            emitJoin(P.pts[i + 1], nrm[i], nrm[i + 1], dir[i], dir[i + 1]);
+        } else if (P.closed) {
+            emitJoin(P.pts[0], nrm[N - 1], nrm[0], dir[N - 1], dir[0]);
+        }
+    }
+
+    if (!P.closed) emitCap(P.pts.back(), dir[N - 2], nrm[N - 2], /*start*/ false);
+    return M;
+}
+
+}  // namespace gfx
+
+```
+
+- `gfx/draw.hpp`
+```cpp
+#pragma once
+#include "core/styles.hpp"
+#include "geom/path.hpp"
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <vector>
+
+namespace gfx {
+
+using geom::AABB;
+using geom::Path;
+using mu::f32;
+using mu::Vec2f;
+
+using PathId = std::uint64_t;
+
+/// Opérations de dessin retenues
+enum class OpKind : uint8_t { StrokePath /*, FillPath (plus tard)*/ };
+
+struct DrawOp {
+    OpKind kind{ OpKind::StrokePath };
+    PathId path;
+    Pen pen;
+    // Transform locale (optionnel) — pour SFML on appliquera CPU
+    mu::Mat3f local = mu::Mat3f::identity();
+    AABB aabb;  // aabb transformée (pour culling rapide)
+};
+
+/// Maillage triangulé (positions + couleur uniforme pour le lot)
+struct Mesh {
+    std::vector<Vec2f> verts;  // triangles: verts.size() % 3 == 0
+    AABB aabb;
+};
+
+/// Interface backend (retenue simple)
+struct IRenderer {
+    virtual ~IRenderer() = default;
+    virtual void drawMeshes(const std::vector<Mesh>& meshes, std::optional<Pen> overridePen) = 0;
+};
+
+}  // namespace gfx
+
+```
+
+- `gfx/frame.hpp`
+```cpp
+#pragma once
+#include "gfx/draw.hpp"
+#include "gfx/triangulate.hpp"
+#include <unordered_map>
+
+namespace gfx {
+
+class PathStore {
+   public:
+    PathId add(geom::Path p) {
+        PathId id = nextId_++;
+        paths_.emplace(id, std::move(p));
+        return id;
+    }
+    const geom::Path* get(PathId id) const {
+        auto it = paths_.find(id);
+        return it == paths_.end() ? nullptr : &it->second;
+    }
+
+   private:
+    PathId nextId_{ 1 };
+    std::unordered_map<PathId, geom::Path> paths_;
+};
+
+class Frame {
+   public:
+    explicit Frame(const AABB& viewport, PathStore& store) : vp_(viewport), store_(store) {
+    }
+
+    void addStroke(PathId id, const Pen& pen, const mu::Mat3f& local = mu::Mat3f::identity()) {
+        const auto* P = store_.get(id);
+        if (!P) return;
+        AABB taabb{};
+        auto add = [&](mu::Vec2f v) { taabb.expand(v); };
+        mu::Vec2f c1{ P->bounds.min.x, P->bounds.min.y };
+        mu::Vec2f c2{ P->bounds.max.x, P->bounds.min.y };
+        mu::Vec2f c3{ P->bounds.max.x, P->bounds.max.y };
+        mu::Vec2f c4{ P->bounds.min.x, P->bounds.max.y };
+        add(local.transformPoint(c1));
+        add(local.transformPoint(c2));
+        add(local.transformPoint(c3));
+        add(local.transformPoint(c4));
+        if (!vp_.overlaps(taabb)) return;
+
+        DrawOp op;
+        op.kind = OpKind::StrokePath;
+        op.path = id;
+        op.pen = pen;
+        op.local = local;
+        op.aabb = taabb;
+        ops_.push_back(std::move(op));
+    }
+
+    void rasterize(IRenderer& renderer);
+    void clear() {
+        ops_.clear();
+    }
+
+    // ---- contrôle finesse des arrondis (en pixels) ----
+    void setArcTolerancePx(float px) {
+        tri_.setArcTolerancePx(px);
+    }
+
+   private:
+    AABB vp_;
+    PathStore& store_;
+    std::vector<DrawOp> ops_;
+    Triangulator tri_;
+
+    struct PenKey {
+        Pen pen;
+        bool operator==(const PenKey& o) const {
+            return pen.width == o.pen.width && pen.color == o.pen.color && pen.cap == o.pen.cap &&
+                   pen.join == o.pen.join && pen.miterLimit == o.pen.miterLimit;
+        }
+    };
+    struct PenKeyHash {
+        size_t operator()(const PenKey& k) const noexcept {
+            size_t h = 0;
+            auto mix = [&](size_t v) { h ^= v + 0x9e37 + (h << 6) + (h >> 2); };
+            mix((size_t)k.pen.color.r | ((size_t)k.pen.color.g << 8) |
+                ((size_t)k.pen.color.b << 16) | ((size_t)k.pen.color.a << 24));
+            mix(std::hash<int>{}(int(k.pen.cap)));
+            mix(std::hash<int>{}(int(k.pen.join)));
+            mix(std::hash<int>{}(int(k.pen.miterLimit * 1024)));
+            mix(std::hash<int>{}(int(k.pen.width * 1024)));
+            return h;
+        }
+    };
+};
+
+}  // namespace gfx
+
+```
+
+- `gfx/triangulate.hpp`
+```cpp
+#pragma once
+#include "gfx/draw.hpp"
+#include <cmath>
+#include <unordered_map>
+
+namespace gfx {
+
+struct StrokeParams {
+    f32 width{ 1.f };
+    LineCap cap{ LineCap::Butt };
+    LineJoin join{ LineJoin::Bevel };
+    f32 miterLimit{ 4.f };
+    // Tolérance d’arc en pixels (plus petit = plus de segments)
+    f32 arcTolPx{ 0.3f };
+
+    bool operator==(const StrokeParams& o) const {
+        return width == o.width && cap == o.cap && join == o.join && miterLimit == o.miterLimit &&
+               arcTolPx == o.arcTolPx;
+    }
+};
+
+struct StrokeParamsHash {
+    size_t operator()(const StrokeParams& p) const noexcept {
+        size_t h = 0x9e3779b97f4a7c15ull;
+        auto mix = [&](size_t v) { h ^= v + 0x9e37 + (h << 6) + (h >> 2); };
+        mix(std::hash<int>{}(int(p.cap)));
+        mix(std::hash<int>{}(int(p.join)));
+        mix(std::hash<int>{}(int(p.miterLimit * 1024)));
+        mix(std::hash<int>{}(int(p.width * 1024)));
+        mix(std::hash<int>{}(int(p.arcTolPx * 1024)));
+        return h;
+    }
+};
+
+struct MeshKey {
+    const Path* path{ nullptr };
+    StrokeParams sp;
+    bool operator==(const MeshKey& o) const noexcept {
+        return path == o.path && sp == o.sp;
+    }
+};
+struct MeshKeyHash {
+    size_t operator()(const MeshKey& k) const noexcept {
+        size_t h = std::hash<const void*>{}(k.path);
+        StrokeParamsHash sph;
+        h ^= sph(k.sp) + 0x9e37 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+class Triangulator {
+   public:
+    void setArcTolerancePx(f32 px) {
+        arcTolPx_ = std::max(0.05f, px);
+    }
+    f32 arcTolerancePx() const {
+        return arcTolPx_;
+    }
+
+    const Mesh& stroke(const Path& P, const Pen& pen);
+    void clear() {
+        cache_.clear();
+    }
+
+   private:
+    std::unordered_map<MeshKey, Mesh, MeshKeyHash> cache_;
+    f32 arcTolPx_{ 0.3f };
+
+    Mesh buildStrokeMesh(const Path& P, const StrokeParams& sp);
+
+    static inline Vec2f perp(const Vec2f& v) {
+        return { -v.y, v.x };
+    }
+    static inline f32 dot(const Vec2f& a, const Vec2f& b) {
+        return a.x * b.x + a.y * b.y;
+    }
+    static inline f32 len(const Vec2f& v) {
+        return std::sqrt(dot(v, v));
+    }
+    static inline Vec2f norm(const Vec2f& v) {
+        f32 L = len(v);
+        return (L > mu::EPS) ? Vec2f{ v.x / L, v.y / L } : Vec2f{ 0, 0 };
+    }
+
+    void addTri(Mesh& m, Vec2f a, Vec2f b, Vec2f c) {
+        m.verts.push_back(a);
+        m.verts.push_back(b);
+        m.verts.push_back(c);
+        m.aabb.expand(a);
+        m.aabb.expand(b);
+        m.aabb.expand(c);
+    }
+};
+
+}  // namespace gfx
 
 ```
 

@@ -23,22 +23,47 @@ FetchContent_Declare(Catch2
   EXCLUDE_FROM_ALL)
 FetchContent_MakeAvailable(Catch2)
 
-# --- Library: mu (your maths etc.)
+# --- mu
 add_library(mu STATIC
   src/core/mu.cpp
 )
 target_include_directories(mu PUBLIC src)
 target_compile_features(mu PUBLIC cxx_std_17)
 
-# --- App
+# --- geom (header-only)
+add_library(geom INTERFACE)
+target_include_directories(geom INTERFACE src)
+target_link_libraries(geom INTERFACE mu)
+
+# --- gfx
+add_library(gfx STATIC
+  src/gfx/triangulate.cpp
+  src/gfx/frame.cpp
+)
+target_include_directories(gfx PUBLIC src)
+target_link_libraries(gfx PUBLIC mu geom)
+
+# --- turtle (header-only)
+add_library(turtle INTERFACE)
+target_include_directories(turtle INTERFACE src)
+target_link_libraries(turtle INTERFACE mu geom gfx)
+
+# --- backend SFML
+add_library(gfx_sfml STATIC
+  src/backends/sfml_renderer.cpp
+  src/backends/sfml_renderer.hpp
+)
+target_include_directories(gfx_sfml PUBLIC src)
+target_link_libraries(gfx_sfml PUBLIC gfx SFML::Graphics)
+
+# --- app
 add_executable(main
   src/main.cpp
 )
-target_link_libraries(main PRIVATE mu SFML::Graphics)
+target_link_libraries(main PRIVATE gfx_sfml turtle)
 
-# --- Tests
+# --- tests
 enable_testing()
-
 add_executable(tests
   tests/mu_tests.cpp
 )
