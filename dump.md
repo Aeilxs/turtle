@@ -11,66 +11,66 @@
 #include "gfx/frame.hpp"
 #include "turtle/turtle.hpp"
 #include <SFML/Graphics.hpp>
+#include <algorithm>
 #include <cmath>
-#include <optional>
+#include <functional>
+#include <vector>
 
-// --------------------- helpers (local to main.cpp) ---------------------
-
-static geom::Path makeParametric(
-    std::function<mu::Vec2f(float)> f, float t0, float t1, int samples, bool closed = true
-) {
-    geom::Path P;
-    P.closed = closed;
-    P.pts.reserve(samples);
-    const float dt = (t1 - t0) / (float)samples;
-    for (int i = 0; i < samples; ++i)
-        P.add(f(t0 + dt * i));
-    return P;
+// -------- helpers maths --------
+static mu::Vec2f rotDeg(const mu::Vec2f& v, float deg) {
+    return mu::rotate(v, deg);
+}
+static mu::Vec2f operator+(mu::Vec2f a, mu::Vec2f b) {
+    return { a.x + b.x, a.y + b.y };
+}
+static mu::Vec2f operator-(mu::Vec2f a, mu::Vec2f b) {
+    return { a.x - b.x, a.y - b.y };
+}
+static mu::Vec2f operator*(mu::Vec2f a, float s) {
+    return { a.x * s, a.y * s };
+}
+static mu::Vec2f operator/(mu::Vec2f a, float s) {
+    return { a.x / s, a.y / s };
 }
 
-static geom::Path makeHypotrochoid(mu::Vec2f c, float R, float r, float d, int samples) {
-    // (R - r) * cos t + d * cos((R - r)/r * t), same for sin
-    float k = (R - r) / r;
-    return makeParametric(
-        [=](float t) {
-            float ct = std::cos(t), st = std::sin(t);
-            float ck = std::cos(k * t), sk = std::sin(k * t);
-            return mu::Vec2f{ c.x + (R - r) * ct + d * ck, c.y + (R - r) * st - d * sk };
-        },
-        0.f,
-        2.f * mu::PI * r / std::gcd((int)std::round(R), (int)std::round(r)),
-        samples,
-        true
-    );
+// Equilatéral CCW centré en c
+static std::vector<mu::Vec2f> makeEquilateral(mu::Vec2f c, float R) {
+    std::vector<mu::Vec2f> t(3);
+    t[0] = { c.x + R * std::cos(mu::deg2rad(-90.f)), c.y + R * std::sin(mu::deg2rad(-90.f)) };
+    t[1] = { c.x + R * std::cos(mu::deg2rad(30.f)), c.y + R * std::sin(mu::deg2rad(30.f)) };
+    t[2] = { c.x + R * std::cos(mu::deg2rad(150.f)), c.y + R * std::sin(mu::deg2rad(150.f)) };
+    return t;  // CCW
 }
 
-static geom::Path makeRose(mu::Vec2f c, float a, float k, int samples) {
-    // r = a * cos(k t)
-    return makeParametric(
-        [=](float t) {
-            float r = a * std::cos(k * t);
-            return mu::Vec2f{ c.x + r * std::cos(t), c.y + r * std::sin(t) };
-        },
-        0.f,
-        2.f * mu::PI,
-        samples,
-        true
-    );
+// Subdivision Koch pour un polygone fermé CCW (bump vers l'extérieur)
+// Pour chaque segment A->B : A, p1, p3, p2 ; (ne push pas B, on restera fermé via Path::closed)
+static std::vector<mu::Vec2f> kochSubdivide(const std::vector<mu::Vec2f>& in) {
+    std::vector<mu::Vec2f> out;
+    out.reserve(in.size() * 4);
+    const size_t N = in.size();
+    for (size_t i = 0; i < N; ++i) {
+        mu::Vec2f A = in[i];
+        mu::Vec2f B = in[(i + 1) % N];
+        mu::Vec2f AB = B - A;
+        mu::Vec2f p1 = A + AB / 3.f;
+        mu::Vec2f p2 = A + AB * (2.f / 3.f);
+        // pic équilatéral côté "extérieur" (= à droite de AB, donc rot -60°)
+        mu::Vec2f p3 = p1 + rotDeg(p2 - p1, -60.f);
+        out.push_back(A);
+        out.push_back(p1);
+        out.push_back(p3);
+        out.push_back(p2);
+        // B sera ajouté comme A du segment suivant
+    }
+    return out;
 }
 
-static geom::Path makeLissajous(
-    mu::Vec2f c, float ax, float ay, float A, float B, float delta, int samples
-) {
-    // x = ax + A * sin(a t + δ), y = ay + B * sin(b t)
-    return makeParametric(
-        [=](float t) {
-            return mu::Vec2f{ c.x + A * std::sin(A * t + delta), c.y + B * std::sin(B * t) };
-        },
-        0.f,
-        2.f * mu::PI,
-        samples,
-        true
-    );
+static std::vector<mu::Vec2f> makeKochSnowflake(mu::Vec2f center, float radius, int iterations) {
+    iterations = std::clamp(iterations, 0, 8);  // 3 * 4^8 points max
+    auto poly = makeEquilateral(center, radius);
+    for (int i = 0; i < iterations; ++i)
+        poly = kochSubdivide(poly);
+    return poly;  // sans point final dupliqué
 }
 
 static mu::Mat3f composeTRS(mu::Vec2f t, float rotDeg, mu::Vec2f s) {
@@ -78,41 +78,13 @@ static mu::Mat3f composeTRS(mu::Vec2f t, float rotDeg, mu::Vec2f s) {
            mu::Mat3f::scale(s.x, s.y);
 }
 
-static void addNeonStroke(
-    gfx::Frame& frame,
-    gfx::PathId id,
-    Color base,
-    float coreWidth,
-    int layers,
-    float spread,
-    gfx::LineJoin join = gfx::LineJoin::Round,
-    gfx::LineCap cap = gfx::LineCap::Round,
-    const mu::Mat3f& M = mu::Mat3f::identity()
-) {
-    // Outer glow layers (large, faint) → inner (small, brighter) → core
-    for (int i = layers; i >= 1; --i) {
-        float t = (float)i / (float)layers;
-        gfx::Pen p{ base, coreWidth + spread * t * t };  // quadratic spread
-        p.color.a = (u8)std::round(14 * t);              // faint alpha
-        p.join = join;
-        p.cap = cap;
-        frame.addStroke(id, p, M);
-    }
-    gfx::Pen core{ base, coreWidth };
-    core.join = join;
-    core.cap = cap;
-    frame.addStroke(id, core, M);
-}
-
-// ------------------------------- main ---------------------------------
-
+// ---------------- main ----------------
 int main() {
-    // MSAA context (works with your current simple renderer as well)
     sf::ContextSettings ctx;
-    ctx.antialiasingLevel = 8;
+    ctx.antiAliasingLevel = 16;
     sf::RenderWindow win(
         sf::VideoMode({ 1280u, 800u }),
-        "RECREATIVE PROGRAMMING WINDOW",
+        "Fractale de Koch — dessin progressif",
         sf::Style::Default,
         sf::State::Windowed,
         ctx
@@ -126,108 +98,88 @@ int main() {
     vp.max = { 1280, 800 };
     gfx::PathStore store;
     gfx::Frame frame(vp, store);
+    frame.setArcTolerancePx(0.12f);
 
-    // ---------- geometry (retained) ----------
-    // Big hypotrochoid (left)
-    auto hypotroId =
-        store.add(makeHypotrochoid({ 0, 0 }, /*R*/ 260.f, /*r*/ 61.f, /*d*/ 92.f, /*samples*/ 3800)
-        );
+    // Paramètres fractale
+    int iterations = 6;              // 2..6 pour rester réactif
+    const float baseRadius = 250.f;  // taille avant transform finale
 
-    // Rose curve (center-top)
-    auto roseId = store.add(makeRose({ 0, 0 }, /*a*/ 150.f, /*k*/ 2.5f, /*samples*/ 3000));
+    // Points source complets pour la fractale
+    std::vector<mu::Vec2f> fullPts = makeKochSnowflake({ 0, 0 }, baseRadius, iterations);
 
-    // Lissajous (right)
-    auto lisId = store.add(makeParametric(
-        [](float t) {
-            return mu::Vec2f{ 0.f + 160.f * std::sin(3.f * t + mu::PI / 3.f),
-                              0.f + 110.f * std::sin(2.f * t) };
-        },
-        0.f,
-        2.f * mu::PI,
-        2600,
-        true
-    ));
+    // Path dynamique qui se remplit
+    geom::Path dyn;
+    dyn.closed = true;
+    dyn.add(fullPts.front());
+    auto dynId = store.add(std::move(dyn));
+    size_t cursor = 1;
 
-    // ---------- styling ----------
-    Color teal{ 20, 200, 160, 255 };
-    Color magenta{ 235, 30, 115, 255 };
-    Color amber{ 255, 180, 40, 255 };
+    // Style de trait
+    gfx::Pen ink{ Color{ 230, 245, 240, 255 }, 1.6f };
+    ink.join = gfx::LineJoin::Round;
+    ink.cap = gfx::LineCap::Round;
 
-    sf::Clock clock;
+    // Animation temps-réel
+    sf::Clock clock, stepClock;
+    float pointsPerSecond = 2500.f;  // vitesse d’apparition (points/s)
+
+    auto rebuildFlake = [&]() {
+        fullPts = makeKochSnowflake({ 0, 0 }, baseRadius, iterations);
+        if (auto* p = store.getMutable(dynId)) {
+            p->clear();
+            p->closed = true;
+            p->add(fullPts.front());
+            cursor = 1;
+            frame.markPathDirty(dynId);
+        }
+    };
 
     while (win.isOpen()) {
-        while (const std::optional event = win.pollEvent()) {
-            if (event->is<sf::Event::Closed>()) win.close();
-            if (const auto* r = event->getIf<sf::Event::Resized>()) {
-                (void)r;
+        while (const std::optional ev = win.pollEvent()) {
+            if (ev->is<sf::Event::Closed>()) win.close();
+            if (const auto* rsz = ev->getIf<sf::Event::Resized>()) {
+                (void)rsz;
                 auto sz = win.getSize();
                 vp.max = { (float)sz.x, (float)sz.y };
             }
+            if (const auto* kp = ev->getIf<sf::Event::KeyPressed>()) {
+                if (kp->scancode == sf::Keyboard::Scancode::R) {
+                    rebuildFlake();
+                }
+                if (kp->scancode == sf::Keyboard::Scancode::Up) {
+                    iterations = std::min(6, iterations + 1);
+                    rebuildFlake();
+                }
+                if (kp->scancode == sf::Keyboard::Scancode::Down) {
+                    iterations = std::max(2, iterations - 1);
+                    rebuildFlake();
+                }
+            }
         }
 
+        // Avancement progressif
+        float dt = stepClock.restart().asSeconds();
+        if (cursor < fullPts.size()) {
+            int n = std::max(1, (int)std::floor(pointsPerSecond * dt));
+            n = std::min<int>(n, (int)fullPts.size() - (int)cursor);
+            if (auto* p = store.getMutable(dynId)) {
+                for (int i = 0; i < n; ++i)
+                    p->add(fullPts[cursor++]);
+                frame.markPathDirty(dynId);
+            }
+        }
+
+        // Rendu
         win.clear(sf::Color(18, 18, 22));
-
-        // time
-        float t = clock.getElapsedTime().asSeconds();
-
-        // ---------- compose scene ----------
         frame.clear();
 
-        // Left: Hypotrochoid neon, gentle rotation + breathing scale
-        {
-            float rot = std::sin(t * 0.35f) * 12.f;
-            float s = 0.98f + 0.02f * std::sin(t * 0.9f);
-            auto M = composeTRS({ 360.f, 430.f }, rot, { s, s });
-            addNeonStroke(
-                frame,
-                hypotroId,
-                teal,
-                /*core*/ 3.2f,
-                /*layers*/ 6,
-                /*spread*/ 28.f,
-                gfx::LineJoin::Round,
-                gfx::LineCap::Round,
-                M
-            );
-        }
+        // petite respiration + rotation lente
+        float t = clock.getElapsedTime().asSeconds();
+        float s = 0.985f + 0.015f * std::sin(t * 0.6f);
+        float rdeg = 4.f * std::sin(t * 0.2f);
+        auto M = composeTRS({ vp.max.x * 0.5f, vp.max.y * 0.52f }, rdeg, { s, s });
 
-        // Center-top: Rose curve, slow drift and rotation the other way
-        {
-            float rot = -std::sin(t * 0.25f) * 25.f;
-            float s = 0.9f + 0.05f * std::sin(t * 0.6f + 1.2f);
-            auto M = composeTRS({ 800.f, 240.f + 10.f * std::sin(t * 0.7f) }, rot, { s, s });
-            addNeonStroke(
-                frame,
-                roseId,
-                magenta,
-                /*core*/ 6.0f,
-                /*layers*/ 8,
-                /*spread*/ 36.f,
-                gfx::LineJoin::Round,
-                gfx::LineCap::Round,
-                M
-            );
-        }
-
-        // Right: Lissajous, subtle wobble
-        {
-            float rot = 10.f * std::sin(t * 0.5f + 0.8f);
-            float s = 1.0f + 0.03f * std::sin(t * 0.8f + 2.2f);
-            auto M = composeTRS({ 980.f, 500.f }, rot, { s, s });
-            addNeonStroke(
-                frame,
-                lisId,
-                amber,
-                /*core*/ 5.0f,
-                /*layers*/ 7,
-                /*spread*/ 30.f,
-                gfx::LineJoin::Round,
-                gfx::LineCap::Round,
-                M
-            );
-        }
-
-        // Rasterize & present
+        frame.addStroke(dynId, ink, M);
         frame.rasterize(renderer);
         win.display();
     }
@@ -676,93 +628,34 @@ class Turtle {
 #pragma once
 #include "gfx/draw.hpp"
 #include <SFML/Graphics.hpp>
-#include <memory>
 
 namespace backends {
 
-/// Renderer SFML avec supersampling + MSAA
 class SfmlRenderer final : public gfx::IRenderer {
    public:
-    struct Options {
-        int supersample = 2;  // 1 = off
-        unsigned msaa = 8;    // anti-aliasing du contexte
-        sf::Color clear{ 18, 18, 22, 255 };
-    };
-
-    explicit SfmlRenderer(sf::RenderWindow& win, Options opt = {}) : win_(win), opt_(opt) {
-        if (opt_.supersample < 1) opt_.supersample = 1;
-        recreateRtIfNeeded();
-        if (rt_) rt_->setSmooth(true);
+    explicit SfmlRenderer(sf::RenderTarget& tgt) : tgt_(tgt) {
     }
 
-    // À appeler en début de frame
-    void beginFrame() {
-        recreateRtIfNeeded();
-        if (rt_)
-            rt_->clear(opt_.clear);
-        else
-            win_.clear(opt_.clear);
-    }
-
-    // IRenderer
     void drawMeshes(const std::vector<gfx::Mesh>& meshes, std::optional<gfx::Pen> overridePen)
         override {
-        if (!overridePen.has_value()) return;
+        if (!overridePen) return;
         sf::Color col(
             overridePen->color.r, overridePen->color.g, overridePen->color.b, overridePen->color.a
         );
-        sf::RenderTarget& tgt =
-            rt_ ? static_cast<sf::RenderTarget&>(*rt_) : static_cast<sf::RenderTarget&>(win_);
 
-        const float S = float(opt_.supersample);
-        for (auto& m : meshes) {
+        for (const auto& m : meshes) {
             if (m.verts.empty()) continue;
             sf::VertexArray va(sf::PrimitiveType::Triangles, m.verts.size());
             for (size_t i = 0; i < m.verts.size(); ++i) {
-                va[i].position = { m.verts[i].x * S, m.verts[i].y * S };
+                va[i].position = { m.verts[i].x, m.verts[i].y };
                 va[i].color = col;
             }
-            tgt.draw(va);
+            tgt_.draw(va);
         }
-    }
-
-    // À appeler en fin de frame (après rasterize)
-    void endFrame() {
-        if (rt_) {
-            rt_->display();
-            sf::Sprite blit(rt_->getTexture());
-            const float invS = 1.f / float(opt_.supersample);
-            blit.setScale(invS, invS);
-            blit.setPosition(0.f, 0.f);
-            win_.draw(blit);
-        }
-        // win_.display() reste côté main loop
-    }
-
-    void onResize() {
-        recreateRtIfNeeded(true);
     }
 
    private:
-    sf::RenderWindow& win_;
-    Options opt_;
-    std::unique_ptr<sf::RenderTexture> rt_;
-
-    void recreateRtIfNeeded(bool force = false) {
-        if (opt_.supersample <= 1) {
-            rt_.reset();
-            return;
-        }
-        auto sz = win_.getSize();
-        sf::Vector2u need{ sz.x * (unsigned)opt_.supersample, sz.y * (unsigned)opt_.supersample };
-        if (!rt_ || force || rt_->getSize() != need) {
-            sf::ContextSettings s;
-            s.antialiasingLevel = opt_.msaa;
-            rt_ = std::make_unique<sf::RenderTexture>();
-            rt_->create(need, s);
-            rt_->setSmooth(true);
-        }
-    }
+    sf::RenderTarget& tgt_;
 };
 
 }  // namespace backends
@@ -1079,6 +972,15 @@ Mesh Triangulator::buildStrokeMesh(const Path& P, const StrokeParams& sp) {
     return M;
 }
 
+void Triangulator::invalidate(const Path* p) {
+    for (auto it = cache_.begin(); it != cache_.end();) {
+        if (it->first.path == p)
+            it = cache_.erase(it);
+        else
+            ++it;
+    }
+}
+
 }  // namespace gfx
 
 ```
@@ -1151,6 +1053,11 @@ class PathStore {
         return it == paths_.end() ? nullptr : &it->second;
     }
 
+    geom::Path* getMutable(PathId id) {
+        auto it = paths_.find(id);
+        return it == paths_.end() ? nullptr : &it->second;
+    }
+
    private:
     PathId nextId_{ 1 };
     std::unordered_map<PathId, geom::Path> paths_;
@@ -1183,6 +1090,10 @@ class Frame {
         op.local = local;
         op.aabb = taabb;
         ops_.push_back(std::move(op));
+    }
+
+    void markPathDirty(PathId id) {
+        if (const auto* P = store_.get(id)) tri_.invalidate(P);
     }
 
     void rasterize(IRenderer& renderer);
@@ -1292,6 +1203,7 @@ class Triangulator {
     void clear() {
         cache_.clear();
     }
+    void invalidate(const Path* p);
 
    private:
     std::unordered_map<MeshKey, Mesh, MeshKeyHash> cache_;
