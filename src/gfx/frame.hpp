@@ -65,7 +65,6 @@ class Frame {
         ops_.clear();
     }
 
-    // ---- contrôle finesse des arrondis (en pixels) ----
     void setArcTolerancePx(float px) {
         tri_.setArcTolerancePx(px);
     }
