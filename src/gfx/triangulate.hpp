@@ -61,6 +61,7 @@ class Triangulator {
     void clear() {
         cache_.clear();
     }
+    void invalidate(const Path* p);
 
    private:
     std::unordered_map<MeshKey, Mesh, MeshKeyHash> cache_;

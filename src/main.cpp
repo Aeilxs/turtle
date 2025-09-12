@@ -7,8 +7,9 @@
 #include <SFML/Graphics.hpp>
 #include <cmath>
 #include <functional>
+#include <vector>
 
-// ---------- utils ----------
+// ----------------- helpers -----------------
 static int gcd_int(int a, int b) {
     a = a < 0 ? -a : a;
     b = b < 0 ? -b : b;
@@ -49,41 +50,11 @@ static geom::Path makeHypotrochoid(mu::Vec2f c, float R, float r, float d, int s
     );
 }
 
-// Rose: r = a * cos(k t). k impair -> période π ; k pair -> 2π.
-static geom::Path makeRose(mu::Vec2f c, float a, int k, int samples) {
-    const float period = (k % 2 != 0) ? mu::PI : 2.f * mu::PI;
-    return makeParametric(
-        [=](float t) {
-            const float r = a * std::cos(k * t);
-            return mu::Vec2f{ c.x + r * std::cos(t), c.y + r * std::sin(t) };
-        },
-        0.f,
-        period,
-        samples,
-        true
-    );
-}
-
-static geom::Path makeLissajous(
-    mu::Vec2f c, float ax, float by, float A, float B, float delta, int samples
-) {
-    return makeParametric(
-        [=](float t) {
-            return mu::Vec2f{ c.x + A * std::sin(ax * t + delta), c.y + B * std::sin(by * t) };
-        },
-        0.f,
-        2.f * mu::PI,
-        samples,
-        true
-    );
-}
-
 static mu::Mat3f composeTRS(mu::Vec2f t, float rotDeg, mu::Vec2f s) {
     return mu::Mat3f::translation(t.x, t.y) * mu::Mat3f::rotation(rotDeg) *
            mu::Mat3f::scale(s.x, s.y);
 }
 
-// ---------- main ----------
 int main() {
     sf::ContextSettings ctx;
     ctx.antiAliasingLevel = 16;
@@ -103,62 +74,78 @@ int main() {
     vp.max = { 1280, 800 };
     gfx::PathStore store;
     gfx::Frame frame(vp, store);
-    frame.setArcTolerancePx(0.18f);  // arrondis lisses
+    frame.setArcTolerancePx(0.14f);
 
-    // Géométrie (samples raisonnables)
-    auto hypotroId = store.add(makeHypotrochoid({ 0, 0 }, 220.f, 72.f, 110.f, 5000));
-    auto roseId = store.add(makeRose({ 0, 0 }, 150.f, /*k=*/27, 1200));  // fermé net à π
-    auto lisId = store.add(makeLissajous({ 0, 0 }, 3.f, 2.f, 160.f, 110.f, mu::PI / 3.f, 1100));
+    const float R = 260.f, r = 73.f, d = 110.f;
+    const int samples = 7200;
+    auto full = makeHypotrochoid({ 0, 0 }, R, r, d, samples);
+    std::vector<mu::Vec2f> curvePts = full.pts;  // source list
 
-    // Stylos (strokes simples)
-    gfx::Pen teal{ Color{ 20, 200, 160, 255 }, 1.0f };
-    teal.join = gfx::LineJoin::Round;
-    teal.cap = gfx::LineCap::Round;
-    gfx::Pen magenta{ Color{ 235, 30, 115, 255 }, 1.0f };
-    magenta.join = gfx::LineJoin::Round;
-    magenta.cap = gfx::LineCap::Round;
-    gfx::Pen amber{ Color{ 255, 180, 40, 255 }, 1.0f };
-    amber.join = gfx::LineJoin::Round;
-    amber.cap = gfx::LineCap::Round;
+    geom::Path dyn;
+    dyn.closed = false;
+    dyn.add(curvePts.front());
+    auto dynId = store.add(std::move(dyn));
+    size_t cursor = 1;
 
-    sf::Clock clock;
+    // Style
+    gfx::Pen ink{ Color{ 230, 245, 240, 255 }, 1.8f };
+    ink.join = gfx::LineJoin::Round;
+    ink.cap = gfx::LineCap::Round;
+
+    // Animation
+    sf::Clock clock, stepClock;
+    const float pxStep = 2.2f;  // ~distance par point (approx)
+    float speedPx = 420.f;      // pixels/s (vitesse de révélation)
+
+    auto resetDrawing = [&]() {
+        if (auto* p = store.getMutable(dynId)) {
+            p->clear();
+            p->closed = false;
+            p->add(curvePts.front());
+            cursor = 1;
+            frame.markPathDirty(dynId);
+        }
+    };
 
     while (win.isOpen()) {
-        while (const std::optional event = win.pollEvent()) {
-            if (event->is<sf::Event::Closed>()) win.close();
-            if (const auto* r = event->getIf<sf::Event::Resized>()) {
-                (void)r;
+        while (const std::optional ev = win.pollEvent()) {
+            if (ev->is<sf::Event::Closed>()) win.close();
+            if (const auto* rsz = ev->getIf<sf::Event::Resized>()) {
+                (void)rsz;
                 auto sz = win.getSize();
                 vp.max = { (float)sz.x, (float)sz.y };
             }
+            if (const auto* kp = ev->getIf<sf::Event::KeyPressed>()) {
+                if (kp->scancode == sf::Keyboard::Scancode::R) resetDrawing();  // relance
+            }
         }
 
+        // --- progression
+        float dt = stepClock.restart().asSeconds();
+        if (cursor < curvePts.size()) {
+            int ptsToAdd = std::max(1, (int)std::floor((speedPx / pxStep) * dt));
+            if (auto* p = store.getMutable(dynId)) {
+                int n = std::min<int>(ptsToAdd, (int)curvePts.size() - (int)cursor);
+                for (int i = 0; i < n; ++i)
+                    p->add(curvePts[cursor++]);
+                frame.markPathDirty(dynId);
+                if (cursor >= curvePts.size()) {
+                    p->closed = true;
+                    frame.markPathDirty(dynId);
+                }
+            }
+        }
+
+        // --- rendu
         win.clear(sf::Color(18, 18, 22));
         frame.clear();
 
         const float t = clock.getElapsedTime().asSeconds();
+        const float s = 0.98f + 0.02f * std::sin(t * 0.7f);  // breathe
+        const float rdeg = std::sin(t * 0.25f) * 6.f;        // rotate
+        auto M = composeTRS({ vp.max.x * 0.5f, vp.max.y * 0.52f }, rdeg, { s, s });
 
-        // Hypotrochoid — gauche
-        {
-            const float rot = std::sin(t * 0.35f) * 9.f;
-            const float s = 0.97f + 0.02f * std::sin(t * 0.9f);
-            auto M = composeTRS({ 360.f, 440.f }, rot, { s, s });
-            frame.addStroke(hypotroId, teal, M);
-        }
-        // Rose — haut centre
-        {
-            const float rot = -std::sin(t * 0.25f) * 22.f;
-            const float s = 0.92f + 0.04f * std::sin(t * 0.6f + 1.1f);
-            auto M = composeTRS({ 800.f, 250.f + 10.f * std::sin(t * 0.7f) }, rot, { s, s });
-            frame.addStroke(roseId, magenta, M);
-        }
-        // Lissajous — droite
-        {
-            const float rot = 10.f * std::sin(t * 0.5f + 0.8f);
-            const float s = 1.00f + 0.03f * std::sin(t * 0.8f + 2.2f);
-            auto M = composeTRS({ 980.f, 520.f }, rot, { s, s });
-            frame.addStroke(lisId, amber, M);
-        }
+        frame.addStroke(dynId, ink, M);
 
         frame.rasterize(renderer);
         win.display();

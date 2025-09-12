@@ -178,4 +178,13 @@ Mesh Triangulator::buildStrokeMesh(const Path& P, const StrokeParams& sp) {
     return M;
 }
 
+void Triangulator::invalidate(const Path* p) {
+    for (auto it = cache_.begin(); it != cache_.end();) {
+        if (it->first.path == p)
+            it = cache_.erase(it);
+        else
+            ++it;
+    }
+}
+
 }  // namespace gfx

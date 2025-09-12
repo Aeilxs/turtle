@@ -17,6 +17,11 @@ class PathStore {
         return it == paths_.end() ? nullptr : &it->second;
     }
 
+    geom::Path* getMutable(PathId id) {
+        auto it = paths_.find(id);
+        return it == paths_.end() ? nullptr : &it->second;
+    }
+
    private:
     PathId nextId_{ 1 };
     std::unordered_map<PathId, geom::Path> paths_;
@@ -49,6 +54,10 @@ class Frame {
         op.local = local;
         op.aabb = taabb;
         ops_.push_back(std::move(op));
+    }
+
+    void markPathDirty(PathId id) {
+        if (const auto* P = store_.get(id)) tri_.invalidate(P);
     }
 
     void rasterize(IRenderer& renderer);
